@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Capture and compare QNX process and memory snapshots from Linux."""
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+from uuid import uuid4
+
+import pexpect
+
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MEMORY_ROW = re.compile(
+    r"^\s*(\d+)\s+\d+\s+.+?\s+([\d]+[KMG]?)\s+([\d]+[KMG]?)\s+[\d]+[KMG]?/[\d]+[KMG]?\s*$"
+)
+SNAPSHOT_COMMAND = "uname -sr && pidin info && pidin ar && pidin mem"
+BOOT_PROMPT = r"(?m)^.*[#\$] *\r?$"
+
+
+def memory_bytes(amount):
+    suffix = amount[-1]
+    if suffix.isdigit():
+        return int(amount)
+    return int(amount[:-1]) * 1024 ** ("KMG".index(suffix) + 1)
+
+
+def parse_snapshot(output):
+    clean = ANSI.sub("", output).replace("\r", "")
+    version = re.search(r"(?m)^QNX (\S+)\s*$", clean)
+    system = re.search(r"FreeMem:(\d+)MB/(\d+)MB\s+BootTime:([^\n]+)", clean)
+    counts = re.search(r"Processes:\s*(\d+),\s*Threads:\s*(\d+)", clean)
+    rows = re.search(r"(?ms)^\s*pid Arguments[^\n]*\n(.*?)^\s*pid tid name[^\n]*\n(.*)", clean)
+    if not all((version, system, counts, rows)):
+        raise ValueError("QNX snapshot incomplete: expected uname and all three pidin sections")
+
+    processes = {}
+    for line in rows[1].splitlines():
+        entry = re.match(r"^\s*(\d+)\s+(\S+)", line)
+        if not entry:
+            continue
+        pid, executable = entry.groups()
+        if executable.rsplit("/", 1)[-1] == "pidin":
+            continue
+        processes[pid] = {"program": executable, "data_bytes": None}
+
+    if not processes:
+        raise ValueError("QNX snapshot contains no process rows")
+    for line in rows[2].splitlines():
+        entry = MEMORY_ROW.match(line)
+        if entry and entry[1] in processes:
+            process = processes[entry[1]]
+            observed = memory_bytes(entry[3])
+            if process["data_bytes"] is None or observed > process["data_bytes"]:
+                process["data_bytes"] = observed
+
+    if all(process["data_bytes"] is None for process in processes.values()):
+        raise ValueError("QNX snapshot contains no matched per-process memory rows")
+    return {
+        "schema": 1,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "qnx_version": version[1],
+        "boot_time": system[3].strip(),
+        "free_mb": int(system[1]),
+        "total_mb": int(system[2]),
+        "process_count": int(counts[1]),
+        "thread_count": int(counts[2]),
+        "processes": processes,
+    }
+
+
+def serial_command(vm, command, timeout):
+    marker = f"__QHM_{uuid4().hex}__"
+    vm.sendline(f"{{ {command}; }}; echo {marker}:${{?}}")
+    vm.expect(re.escape(marker) + r":(\d+)\r+\n", timeout=timeout)
+    output = vm.before.partition("\n")[2]
+    if vm.match[1] != "0":
+        raise RuntimeError(f"Guest command failed with exit status {vm.match[1]}")
+    return output
+
+
+def await_console(vm, timeout, user):
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        vm.sendline("")
+        result = vm.expect(
+            [BOOT_PROMPT, r"(?im)^login: *\r?$", pexpect.TIMEOUT],
+            timeout=min(5, remaining),
+        )
+        if result == 0:
+            return
+        if result == 1:
+            if not user:
+                raise RuntimeError("QNX requested a serial login. Pass --user and set QHM_GUEST_PASSWORD if required")
+            vm.sendline(user)
+            result = vm.expect([BOOT_PROMPT, r"(?i)password: *", r"(?i)login (?:incorrect|failed)"], timeout=25)
+            if result == 1:
+                password = os.environ.get("QHM_GUEST_PASSWORD")
+                if password is None:
+                    raise RuntimeError("QNX requested a password. Set QHM_GUEST_PASSWORD")
+                vm.sendline(password)
+                result = vm.expect([BOOT_PROMPT, r"(?i)login (?:incorrect|failed)"], timeout=25)
+                if result == 0:
+                    return
+                raise RuntimeError("QNX serial login failed")
+            if result == 0:
+                return
+            raise RuntimeError("QNX serial login failed")
+    raise RuntimeError("No ready QNX shell on the serial console")
+
+
+def compare(before, after):
+    if before["schema"] != 1 or after["schema"] != 1:
+        raise ValueError("Unsupported snapshot format")
+    identity = ("qnx_version", "boot_time", "total_mb")
+    if any(before[field] != after[field] for field in identity):
+        raise ValueError("Snapshots must come from the same QNX boot and memory configuration")
+    lines = [f"QNX {before['qnx_version']} | before → after"]
+    for field, title, unit in (
+        ("process_count", "Processes", ""),
+        ("thread_count", "Threads", ""),
+        ("free_mb", "Free memory (pidin)", " MB"),
+    ):
+        old, new = before[field], after[field]
+        lines.append(f"{title}: {old} → {new}{unit} ({new - old:+d}{unit})")
+
+    old, new = before["processes"], after["processes"]
+    for pid in sorted(old.keys() | new.keys(), key=int):
+        first, second = old.get(pid), new.get(pid)
+        if first and (second is None or first["program"] != second["program"]):
+            lines.append(f"- PID {pid} {first['program']}")
+        if second and (first is None or first["program"] != second["program"]):
+            amount = second["data_bytes"]
+            details = "data unavailable" if amount is None else f"data {amount / 1024**2:.2f} MiB"
+            lines.append(f"+ PID {pid} {second['program']} | {details}")
+        if first and second and first["program"] == second["program"]:
+            a, b = first["data_bytes"], second["data_bytes"]
+            if a is not None and b is not None and a != b:
+                lines.append(f"~ PID {pid} {second['program']} | data {(b - a) / 1024**2:+.2f} MiB")
+    return "\n".join(lines)
+
+
+def run(args):
+    vm_command = args.vm[1:] if args.vm[:1] == ["--"] else args.vm
+    if not vm_command:
+        raise ValueError("Pass a QEMU command after --")
+    args.output.mkdir(parents=True, exist_ok=False)
+    vm = pexpect.spawn(vm_command[0], vm_command[1:], encoding="utf-8", codec_errors="replace")
+    vm.delaybeforesend = 0.35
+    try:
+        await_console(vm, args.boot_timeout, args.user)
+        serial_command(vm, f"sleep {args.settle}", args.settle + 30)
+        if args.prepare:
+            serial_command(vm, args.prepare, args.workload_timeout)
+        before = parse_snapshot(serial_command(vm, SNAPSHOT_COMMAND, 45))
+        (args.output / "before.json").write_text(json.dumps(before, indent=2) + "\n")
+        serial_command(vm, args.workload, args.workload_timeout)
+        after = parse_snapshot(serial_command(vm, SNAPSHOT_COMMAND, 45))
+        (args.output / "after.json").write_text(json.dumps(after, indent=2) + "\n")
+        report = compare(before, after)
+        (args.output / "diff.txt").write_text(report + "\n")
+        print(report)
+    finally:
+        vm.close(force=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    capture = sub.add_parser("run", help="start a VM and capture before/after snapshots")
+    capture.add_argument("--output", required=True, type=Path, help="new output directory")
+    capture.add_argument("--prepare", help="trusted guest shell command to prepare the VM before the baseline")
+    capture.add_argument("--workload", required=True, help="trusted guest shell command that returns once the workload is ready")
+    capture.add_argument("--user", help="guest serial login username, if required")
+    capture.add_argument("--boot-timeout", type=int, default=150)
+    capture.add_argument("--workload-timeout", type=int, default=45)
+    capture.add_argument("--settle", type=int, default=20)
+    capture.add_argument("vm", nargs=argparse.REMAINDER, help="QEMU command after --")
+    diff = sub.add_parser("diff", help="compare previously captured JSON snapshots")
+    diff.add_argument("before", type=Path)
+    diff.add_argument("after", type=Path)
+    args = parser.parse_args()
+
+    try:
+        if args.action == "run":
+            if args.settle < 0 or min(args.boot_timeout, args.workload_timeout) < 1:
+                raise ValueError("Timeouts must be positive and settle must be nonnegative")
+            run(args)
+        else:
+            print(compare(json.loads(args.before.read_text()), json.loads(args.after.read_text())))
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, pexpect.ExceptionPexpect) as error:
+        print(f"{parser.prog}: {error.__class__.__name__}: {str(error).splitlines()[0]}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
