@@ -1,0 +1,5 @@
+QNX 8.0.0 | before → after
+Processes: 25 → 26 (+1)
+Threads: 167 → 168 (+1)
+Free memory (pidin): 3775 → 3710 MB (-65 MB)
++ PID 4247569 /data/w/qnx-health-load | data 64.00 MiB
